@@ -103,3 +103,39 @@ D:\work\知识库\.obsidian\plugins\quark-probe\main.js
 6. **看结果**：手机上会弹一条 `Notice`，列出 `[1]/[2]/[3]` 三个目标的 `hasSetCookie:true/false` 与命中个数——这就是判定行。完整 `headers` JSON 只在桌面版 console（`Ctrl+Shift+I`）里能看到；手机端如需完整证据，可截图 Notice 或把这 3 行手抄回来。
 
 > 提示：BRAT 装的是 Release 资产，所以**升级版本必须新打 tag + Release**；改代码不重打 tag 不会自动更新。
+
+---
+
+## 扫码登录验证（0.1.1 新增命令）
+
+一次性 spike，用来验证「手机 Obsidian 显示二维码 → 夸克 App 识别 → 回到 Obsidian 看到状态 → 换到 Cookie 并验活」这条链路。
+
+### 操作步骤（手机 / 桌面通用）
+
+1. 命令面板执行 **`Quark: 扫码登录验证`**。
+2. 弹窗里会出现二维码与状态行（状态行会显示「等待扫码…」）。
+3. **截图**弹窗中的二维码（手机：音量键+电源键；桌面：截图工具）。
+4. 打开**夸克 App** → 扫一扫 → 从**相册**选择刚才的截图 → 在夸克里确认登录。
+5. **切回 Obsidian**（弹窗仍未关闭）。插件会在你回到前台时**立刻补一次轮询**（不用等 2 秒）。
+6. 状态会依次变成：
+   - `已获取 token，等待扫码/确认…`
+   - `已拿到 service_ticket，正在换 Cookie…`
+   - `验证成功：code=0，根目录条目数=N`
+7. 成功后弹窗里会显示：`set-cookie 条数=…；名称集合=[__pus, __puus, __uid …]；__pus=true；__puus=true`。
+
+### 安全说明
+
+- **Cookie 只存在弹窗对象的内存里**，关闭弹窗即丢弃；不写插件数据文件、不写浏览器数据库、不写密钥存储、不落任何文件。
+- 界面、`Notice`、console **都不显示 cookie 值**，只显示名称集合与 `__pus`/`__puus` 是否存在。
+- 二维码内容只有 66 字符：`https://su.quark.cn/4_eMHBJ?token=<32 位 token>`。
+
+### 常见状态
+
+| 现象 | 含义 | 处理 |
+|---|---|---|
+| `二维码已过期或 token 失效（50004002）` | token 超过有效期 | 点「重新生成」再扫 |
+| `二维码已超时（累计 5 分钟未完成）` | 弹窗开着超过 5 分钟 | 点「重新生成」 |
+| `换 Cookie 失败：响应 headers 里没有 set-cookie` | 该端 `requestUrl` 没暴露 `set-cookie` | 把环境（手机型号 / Obsidian 版本）记下来反馈 |
+| `验活失败：code=…` | Cookie 拿到了但无权/已失效 | 重新扫码；仍失败则记录 code |
+
+> 已知限制：ticket 成功响应里 `service_ticket` 的字段路径是**按常见形态兜底解析**的（`data.members.service_ticket` / `data.service_ticket` / …），真机第一次跑如果提示「已返回成功但未找到 service_ticket 字段」，把响应结构贴回来即可，改动只有一行。

@@ -1,7 +1,7 @@
 {
   "id": "quark-probe",
   "name": "Quark Set-Cookie Probe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.5.0",
   "description": "One-shot probe: does Obsidian requestUrl expose Set-Cookie response headers? Prints hasSetCookie per target and full headers JSON.",
   "author": "dsh-probe",
