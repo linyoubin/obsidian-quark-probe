@@ -2583,6 +2583,9 @@ var qrcode = function() {
 
 const QUARK_TOKEN_URL =
   "https://uop.quark.cn/cas/ajax/getTokenForQrcodeLogin?client_id=532&v=1.2&request_id=";
+// 0.1.4：先访问 CAS 登录页建立会话（浏览器是页面加载时就有的，我们没有 cookie jar）
+const QUARK_CAS_LOGIN =
+  "https://uop.quark.cn/cas/custom/login?custom_login_type=mobile&client_id=532&display=pc";
 const QUARK_TICKET_URL_TOKEN =
   "https://uop.quark.cn/cas/ajax/getServiceTicketByQrcodeToken?token=";
 const QUARK_TICKET_URL =
@@ -2653,21 +2656,48 @@ function qrIsJsonResponse(res) {
   }
 }
 
-// 响应头里的 set-cookie（大小写不敏感，可能是数组）
+// 把单个 set-cookie 值拆成多条（平台可能把多条合并成 ", " 分隔的一串）
+function qrSplitSetCookieValue(v) {
+  if (Array.isArray(v)) {
+    const arr = [];
+    for (let i = 0; i < v.length; i++) arr.push(String(v[i]));
+    return arr;
+  }
+  const s = String(v == null ? "" : v);
+  // 仅当逗号后紧跟 name= 时才认为是新的一条（避免把 Expires 里的逗号切坏）
+  return s.split(/,\s*(?=[!#$%&'*+\-.^_`|~0-9A-Za-z]+=)/);
+}
+
+// 响应头里的 set-cookie（大小写不敏感；数组与逗号串都正确拆）
 function qrSetCookieList(headers) {
   const out = [];
   if (!headers || typeof headers !== "object") return out;
   const keys = Object.keys(headers);
   for (let i = 0; i < keys.length; i++) {
     if (keys[i].toLowerCase().indexOf("set-cookie") !== 0) continue;
-    const v = headers[keys[i]];
-    if (Array.isArray(v)) {
-      for (let j = 0; j < v.length; j++) out.push(String(v[j]));
-    } else {
-      out.push(String(v));
-    }
+    const parts = qrSplitSetCookieValue(headers[keys[i]]);
+    for (let j = 0; j < parts.length; j++) out.push(parts[j]);
   }
   return out;
+}
+
+function qrCookieNameOf(pair) {
+  const i = String(pair).indexOf("=");
+  return i > 0 ? String(pair).slice(0, i).trim() : "";
+}
+
+// 按 name 合并（后来的覆盖先来的），保证同一 cookie 只出现一次
+function qrMergeCookies(base, add) {
+  const map = new Map();
+  for (let i = 0; i < base.length; i++) {
+    const n = qrCookieNameOf(base[i]);
+    if (n) map.set(n, base[i]);
+  }
+  for (let i = 0; i < add.length; i++) {
+    const n = qrCookieNameOf(add[i]);
+    if (n) map.set(n, add[i]);
+  }
+  return Array.from(map.values());
 }
 
 function qrCookieNames(list) {
@@ -2710,7 +2740,7 @@ class QuarkQrLoginModal extends Modal {
     this.onVis = null;
     this.timeline = []; // 只含 status/message 与事件名，不含 token/cookie 值
     this.timelineEl = null;
-    this.tokenCookies = []; // 取 token 响应下发的 cookie（k=v），只进内存
+    this.casCookies = []; // CAS 会话 cookie + token 响应 cookie（k=v），只进内存
   }
 
   onOpen() {
@@ -2866,12 +2896,16 @@ class QuarkQrLoginModal extends Modal {
     new Notice(ok ? "时间线已复制（" + this.timeline.length + " 行）" : "复制失败，请展开时间线手动截图");
   }
 
-  // 统一请求头：UA + Referer；有 token 阶段收集的 cookie 就带上
+  // 统一请求头：UA + Referer + Origin；有 CAS 会话 cookie 就带上
   authHeaders() {
-    const h = { "User-Agent": QR_UA, Referer: QR_REFERER };
-    if (this.tokenCookies && this.tokenCookies.length) {
-      h.Cookie = this.tokenCookies.join("; ");
-    }
+    const h = {
+      "User-Agent": QR_UA,
+      Referer: QR_REFERER,
+      Origin: "https://pan.quark.cn",
+    };
+    const ck =
+      this.casCookies && this.casCookies.length ? this.casCookies.join("; ") : "";
+    if (ck) h.Cookie = ck;
     return h;
   }
 
@@ -2919,7 +2953,7 @@ class QuarkQrLoginModal extends Modal {
     this.stop();
     this.finished = false;
     this.cookie = null;
-    this.tokenCookies = [];
+    this.casCookies = [];
     this.timeline = [];
     this.renderTimeline();
     this.qrEl.empty();
@@ -2927,18 +2961,33 @@ class QuarkQrLoginModal extends Modal {
     this.setStatus("正在获取二维码 token…");
     this.rid = qrRequestId();
     try {
+      // 0.1.4 步骤 1：先 GET CAS 登录页建立会话，拿 _UP_* 系列 cookie（失败不中断）
+      try {
+        const casRes = await requestUrl({
+          url: QUARK_CAS_LOGIN,
+          method: "GET",
+          headers: this.authHeaders(),
+          throw: false,
+        });
+        const casRaw = qrSetCookieList(casRes.headers);
+        this.casCookies = qrMergeCookies(this.casCookies, qrCookiePairs(casRaw));
+        this.logEvent("casSetCookieNames=[" + qrCookieNames(casRaw).join(",") + "]");
+      } catch (e) {
+        this.logEvent("casSessionFailed=" + (e && e.message ? e.message : "error"));
+      }
+      // 0.1.4 步骤 2：取 token（带上 CAS 会话 cookie），并继续收集响应 cookie
       const res = await requestUrl({
         url: QUARK_TOKEN_URL + encodeURIComponent(this.rid),
         method: "GET",
-        headers: { "User-Agent": QR_UA, Referer: QR_REFERER },
+        headers: this.authHeaders(),
         throw: false,
       });
-      // 0.1.3：取 token 时把下发的 set-cookie 收下（无 cookie jar，只能自己带）
       const rawCookies = qrSetCookieList(res.headers);
-      this.tokenCookies = qrCookiePairs(rawCookies);
+      this.casCookies = qrMergeCookies(this.casCookies, qrCookiePairs(rawCookies));
       this.logEvent(
         "tokenRespSetCookieNames=[" + qrCookieNames(rawCookies).join(",") + "]"
       );
+      this.logEvent("cookieHeaderLen=" + this.casCookies.join("; ").length);
       const j = qrParseJson(res.text);
       const token = j && j.data && j.data.members && j.data.members.token;
       if (j.status !== 2000000 || !token) {
@@ -2985,7 +3034,13 @@ class QuarkQrLoginModal extends Modal {
     this.busy = true;
     try {
       const headers = this.authHeaders();
-      this.logEvent("pollHeaders(cookieCount=" + this.tokenCookies.length + ")");
+      this.logEvent(
+        "pollHeaders(cookieCount=" +
+          this.casCookies.length +
+          ", cookieHeaderLen=" +
+          this.casCookies.join("; ").length +
+          ")"
+      );
       let res = await requestUrl({
         url: QUARK_TICKET_URL_TOKEN + encodeURIComponent(this.token),
         method: "GET",

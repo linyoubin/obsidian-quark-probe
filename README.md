@@ -106,7 +106,7 @@ D:\work\知识库\.obsidian\plugins\quark-probe\main.js
 
 ---
 
-## 扫码登录验证（0.1.3 起可用）
+## 扫码登录验证（0.1.4 起可用）
 
 一次性 spike，用来验证「手机 Obsidian 显示二维码 → 夸克 App 识别 → 回到 Obsidian 看到状态 → 换到 Cookie 并验活」这条链路。
 
@@ -130,6 +130,7 @@ D:\work\知识库\.obsidian\plugins\quark-probe\main.js
 - 二维码内容是**完整 URL**（token + `client_id=532` + `ssb=weblogin` + `uc_param_str=` + `uc_biz_str`，`uc_biz_str` 内的 `|`/`@`/`:` 已 percent-encode，约 250 字符）。只带 token 的短 URL 会被夸克确认页判成「登录请求已过期」。
 - **token 实测有效期 184 秒**（匿名探测：t+169s 仍等待，t+184s 变 `50004002`）。弹窗客户端上限取 180 秒并在弹窗里每秒倒计时，剩余 ≤30 秒变红，提前 4 秒主动停止。
 - **0.1.3 起模拟浏览器会话**：取 token 时收下响应 `set-cookie`（只存内存），轮询与 `account/info?st=` 都回带 `Cookie` 头，并统一带 `Referer: https://pan.quark.cn/` 与桌面 Chrome UA——没有 cookie jar 时，这几项缺一都可能被 CAS 判成「登录请求已过期」。
+- **0.1.4 起先建会话再要票**：先 `GET uop.quark.cn/cas/custom/login?…` 拿 `_UP_*` 会话 cookie（尤其 `_UP_F7E_8D_`），再取 token，并用同一套 cookie 走轮询与 `account/info?st=`；请求统一带 `Origin: https://pan.quark.cn`。同时修掉「多条 Set-Cookie 被平台合并成逗号串」的解析问题。
 - 弹窗里可展开**时间线**（`+Ns | status | message` 与关键事件），点「复制时间线」即可整段贴回排查。
 
 ### 常见状态
