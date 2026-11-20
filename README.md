@@ -106,7 +106,7 @@ D:\work\知识库\.obsidian\plugins\quark-probe\main.js
 
 ---
 
-## 扫码登录验证（0.1.1 新增命令）
+## 扫码登录验证（0.1.3 起可用）
 
 一次性 spike，用来验证「手机 Obsidian 显示二维码 → 夸克 App 识别 → 回到 Obsidian 看到状态 → 换到 Cookie 并验活」这条链路。
 
@@ -127,14 +127,17 @@ D:\work\知识库\.obsidian\plugins\quark-probe\main.js
 
 - **Cookie 只存在弹窗对象的内存里**，关闭弹窗即丢弃；不写插件数据文件、不写浏览器数据库、不写密钥存储、不落任何文件。
 - 界面、`Notice`、console **都不显示 cookie 值**，只显示名称集合与 `__pus`/`__puus` 是否存在。
-- 二维码内容只有 66 字符：`https://su.quark.cn/4_eMHBJ?token=<32 位 token>`。
+- 二维码内容是**完整 URL**（token + `client_id=532` + `ssb=weblogin` + `uc_param_str=` + `uc_biz_str`，`uc_biz_str` 内的 `|`/`@`/`:` 已 percent-encode，约 250 字符）。只带 token 的短 URL 会被夸克确认页判成「登录请求已过期」。
+- **token 实测有效期 184 秒**（匿名探测：t+169s 仍等待，t+184s 变 `50004002`）。弹窗客户端上限取 180 秒并在弹窗里每秒倒计时，剩余 ≤30 秒变红，提前 4 秒主动停止。
+- **0.1.3 起模拟浏览器会话**：取 token 时收下响应 `set-cookie`（只存内存），轮询与 `account/info?st=` 都回带 `Cookie` 头，并统一带 `Referer: https://pan.quark.cn/` 与桌面 Chrome UA——没有 cookie jar 时，这几项缺一都可能被 CAS 判成「登录请求已过期」。
+- 弹窗里可展开**时间线**（`+Ns | status | message` 与关键事件），点「复制时间线」即可整段贴回排查。
 
 ### 常见状态
 
 | 现象 | 含义 | 处理 |
 |---|---|---|
-| `二维码已过期或 token 失效（50004002）` | token 超过有效期 | 点「重新生成」再扫 |
-| `二维码已超时（累计 5 分钟未完成）` | 弹窗开着超过 5 分钟 | 点「重新生成」 |
+| `夸克侧 token 已过期（50004002，实测有效期 184 秒）` | 夸克服务端判定 token 过期（不是插件超时） | 点「重新生成」再扫；注意从二维码出现到确认要在 3 分钟内 |
+| `插件已主动停止轮询（客户端上限 180 秒；服务端实测 184 秒）` | 插件侧超时（弹窗开太久） | 点「重新生成」 |
 | `换 Cookie 失败：响应 headers 里没有 set-cookie` | 该端 `requestUrl` 没暴露 `set-cookie` | 把环境（手机型号 / Obsidian 版本）记下来反馈 |
 | `验活失败：code=…` | Cookie 拿到了但无权/已失效 | 重新扫码；仍失败则记录 code |
 

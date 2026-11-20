@@ -2583,14 +2583,41 @@ var qrcode = function() {
 
 const QUARK_TOKEN_URL =
   "https://uop.quark.cn/cas/ajax/getTokenForQrcodeLogin?client_id=532&v=1.2&request_id=";
+const QUARK_TICKET_URL_TOKEN =
+  "https://uop.quark.cn/cas/ajax/getServiceTicketByQrcodeToken?token=";
 const QUARK_TICKET_URL =
   "https://uop.quark.cn/cas/ajax/getServiceTicketByQrcodeToken?client_id=532&v=1.2";
+// 0.1.2：二维码必须带完整参数。只带 token 时夸克 App 能打开确认页，但会提示
+// 「登录请求已过期」——确认页要用 client_id/ssb/uc_param_str/uc_biz_str 绑定这次登录请求。
+// uc_biz_str 按官方 url.format 的效果逐值 percent-encode（|→%7C、@→%40、:→%3A），
+// 与 pan.quark.cn 登录页 / QuarkPan 的实现字节一致。
 const QUARK_QR_PREFIX = "https://su.quark.cn/4_eMHBJ?token=";
+const QUARK_QR_UC_BIZ_STR =
+  "S:custom|OPT:SAREA@0|OPT:IMMERSIVE@1|OPT:BACK_BTN_STYLE@0";
+const QUARK_QR_SUFFIX =
+  "&client_id=532&ssb=weblogin&uc_param_str=&uc_biz_str=" +
+  encodeURIComponent(QUARK_QR_UC_BIZ_STR);
 const QUARK_ACCOUNT_INFO = "https://pan.quark.cn/account/info?st=";
 const QUARK_FILE_SORT =
   "https://drive-pc.quark.cn/1/clouddrive/file/sort?pdir_fid=0&_page=1&_size=20&_fetch_total=1&pr=ucpro&fr=pc";
-const QR_TTL_MS = 5 * 60 * 1000;
+// token TTL 实测（2026-11-20 匿名探测）：t+169s 仍 50004001，t+184s 变 50004002（Token Not Found）
+// 客户端上限 180s：服务端实测 184s，提前 4s 主动停，避免「插件还在等、夸克已过期」的错位
+const QR_TTL_SECONDS = 184;
+const QR_TTL_MS = 180000;
 const QR_POLL_MS = 2000;
+// 0.1.3：与官方浏览器请求对齐的头部（官方由浏览器自动带 cookie/UA/Referer）
+const QR_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36";
+const QR_REFERER = "https://pan.quark.cn/";
+
+function qrCookiePairs(list) {
+  const out = [];
+  for (let i = 0; i < list.length; i++) {
+    const first = (String(list[i]).split(";")[0] || "").trim();
+    if (first && first.indexOf("=") > 0) out.push(first);
+  }
+  return out;
+}
 
 function qrRequestId() {
   try {
@@ -2612,6 +2639,17 @@ function qrParseJson(text) {
     return JSON.parse(text);
   } catch (e) {
     return {};
+  }
+}
+
+// 0.1.3：官方轮询只带 token。仅当响应不是合法 JSON 或 HTTP 4xx 时才回退旧形态
+function qrIsJsonResponse(res) {
+  if (!res || typeof res.status !== "number" || res.status >= 400) return false;
+  try {
+    const j = JSON.parse(res.text);
+    return Boolean(j) && typeof j.status === "number";
+  } catch (e) {
+    return false;
   }
 }
 
@@ -2664,11 +2702,15 @@ class QuarkQrLoginModal extends Modal {
     this.token = null;
     this.rid = null;
     this.timer = null;
+    this.countTimer = null;
     this.startedAt = 0;
     this.busy = false;
     this.finished = false;
     this.cookie = null; // 仅内存，关闭即丢
     this.onVis = null;
+    this.timeline = []; // 只含 status/message 与事件名，不含 token/cookie 值
+    this.timelineEl = null;
+    this.tokenCookies = []; // 取 token 响应下发的 cookie（k=v），只进内存
   }
 
   onOpen() {
@@ -2678,6 +2720,22 @@ class QuarkQrLoginModal extends Modal {
     this.statusEl = c.createEl("div", { text: "正在获取二维码…" });
     this.qrEl = c.createEl("div");
     this.detailEl = c.createEl("div", { text: "" });
+    this.countdownEl = c.createEl("div", { text: "" });
+    const tlBtn = c.createEl("button", { text: "显示时间线" });
+    this.timelineEl = c.createEl("pre", { text: "" });
+    this.timelineEl.style.display = "none";
+    this.timelineEl.style.whiteSpace = "pre-wrap";
+    this.timelineEl.style.fontSize = "12px";
+    this.timelineEl.style.maxHeight = "200px";
+    this.timelineEl.style.overflow = "auto";
+    tlBtn.addEventListener("click", () => {
+      const show = this.timelineEl.style.display === "none";
+      this.timelineEl.style.display = show ? "block" : "none";
+      tlBtn.setText(show ? "隐藏时间线" : "显示时间线");
+      if (show) this.renderTimeline();
+    });
+    const cpBtn = c.createEl("button", { text: "复制时间线" });
+    cpBtn.addEventListener("click", () => this.copyTimeline());
     const btn = c.createEl("button", { text: "重新生成" });
     btn.addEventListener("click", () => {
       this.finished = false;
@@ -2686,7 +2744,13 @@ class QuarkQrLoginModal extends Modal {
     });
     this.onVis = () => {
       if (typeof document === "undefined") return;
-      if (document.visibilityState !== "visible" || this.finished || !this.token) return;
+      if (document.visibilityState === "visible") {
+        this.logEvent("visibilitychange→visible");
+      } else {
+        this.logEvent("visibilitychange→hidden");
+        return;
+      }
+      if (this.finished || !this.token) return;
       // 从夸克 App 回来：立即补一次轮询，并重置 2 秒计时
       this.tick();
       this.restartTimer();
@@ -2713,12 +2777,102 @@ class QuarkQrLoginModal extends Modal {
       clearInterval(this.timer);
       this.timer = null;
     }
+    if (this.countTimer) {
+      clearInterval(this.countTimer);
+      this.countTimer = null;
+    }
+  }
+
+  // 剩余秒数倒计时：每秒刷新；≤30 秒变提示色
+  startCountdown() {
+    if (this.countTimer) {
+      clearInterval(this.countTimer);
+      this.countTimer = null;
+    }
+    const render = () => {
+      if (!this.countdownEl) return;
+      const left = Math.max(0, Math.ceil((QR_TTL_MS - (Date.now() - this.startedAt)) / 1000));
+      const warn = left <= 30;
+      this.countdownEl.setText(
+        "剩余 " +
+          left +
+          " 秒（客户端上限 " +
+          Math.round(QR_TTL_MS / 1000) +
+          " 秒；token 实测有效期 " +
+          QR_TTL_SECONDS +
+          " 秒，提前 4 秒停）"
+      );
+      this.countdownEl.style.color = warn ? "#d14343" : "";
+      this.countdownEl.style.fontWeight = warn ? "bold" : "";
+    };
+    render();
+    this.countTimer = setInterval(render, 1000);
   }
 
   restartTimer() {
     this.stop();
     if (this.finished || !this.token) return;
     this.timer = setInterval(() => this.tick(), QR_POLL_MS);
+  }
+
+  // —— 时间线（只含 status/message 与事件名，不含 token/cookie 值）——
+  logEvent(name) {
+    const el = this.startedAt ? Math.round((Date.now() - this.startedAt) / 1000) : 0;
+    this.timeline.push("+" + el + "s | event | " + name);
+    if (this.timeline.length > 200) this.timeline.shift();
+    this.renderTimeline();
+  }
+
+  logPoll(status, message) {
+    const el = this.startedAt ? Math.round((Date.now() - this.startedAt) / 1000) : 0;
+    const msg = message ? String(message).slice(0, 40) : "";
+    this.timeline.push("+" + el + "s | " + status + " | " + msg);
+    if (this.timeline.length > 200) this.timeline.shift();
+    this.renderTimeline();
+  }
+
+  timelineText() {
+    return this.timeline.join("\n");
+  }
+
+  renderTimeline() {
+    if (this.timelineEl) this.timelineEl.setText(this.timelineText());
+  }
+
+  async copyTimeline() {
+    const text = this.timelineText();
+    let ok = false;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      }
+    } catch (e) {
+      ok = false;
+    }
+    if (!ok) {
+      try {
+        const host = this.contentEl || (typeof document !== "undefined" && document.body);
+        const ta = host.createEl("textarea");
+        ta.value = text;
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+        ok = true;
+      } catch (e) {
+        ok = false;
+      }
+    }
+    new Notice(ok ? "时间线已复制（" + this.timeline.length + " 行）" : "复制失败，请展开时间线手动截图");
+  }
+
+  // 统一请求头：UA + Referer；有 token 阶段收集的 cookie 就带上
+  authHeaders() {
+    const h = { "User-Agent": QR_UA, Referer: QR_REFERER };
+    if (this.tokenCookies && this.tokenCookies.length) {
+      h.Cookie = this.tokenCookies.join("; ");
+    }
+    return h;
   }
 
   setStatus(t) {
@@ -2765,6 +2919,9 @@ class QuarkQrLoginModal extends Modal {
     this.stop();
     this.finished = false;
     this.cookie = null;
+    this.tokenCookies = [];
+    this.timeline = [];
+    this.renderTimeline();
     this.qrEl.empty();
     this.detailEl.setText("");
     this.setStatus("正在获取二维码 token…");
@@ -2773,8 +2930,15 @@ class QuarkQrLoginModal extends Modal {
       const res = await requestUrl({
         url: QUARK_TOKEN_URL + encodeURIComponent(this.rid),
         method: "GET",
+        headers: { "User-Agent": QR_UA, Referer: QR_REFERER },
         throw: false,
       });
+      // 0.1.3：取 token 时把下发的 set-cookie 收下（无 cookie jar，只能自己带）
+      const rawCookies = qrSetCookieList(res.headers);
+      this.tokenCookies = qrCookiePairs(rawCookies);
+      this.logEvent(
+        "tokenRespSetCookieNames=[" + qrCookieNames(rawCookies).join(",") + "]"
+      );
       const j = qrParseJson(res.text);
       const token = j && j.data && j.data.members && j.data.members.token;
       if (j.status !== 2000000 || !token) {
@@ -2782,11 +2946,22 @@ class QuarkQrLoginModal extends Modal {
         return;
       }
       this.token = token;
-      const payload = QUARK_QR_PREFIX + token; // 66 字符，不拼其它参数
-      this.renderQr(payload);
-      this.setStatus("等待扫码：请截图，用夸克 App 识别二维码（约 5 分钟有效）");
-      this.detailEl.setText("二维码内容长度 " + payload.length + " 字符；扫码后在夸克里确认，再回到本页。");
       this.startedAt = Date.now();
+      this.logEvent("token created");
+      const payload = QUARK_QR_PREFIX + token + QUARK_QR_SUFFIX;
+      this.renderQr(payload);
+      this.setStatus(
+        "等待扫码：请截图，用夸克 App 识别二维码（token 实测 " +
+          QR_TTL_SECONDS +
+          " 秒有效；剩余秒数见下方倒计时）"
+      );
+      this.detailEl.setText(
+        "二维码内容长度 " +
+          payload.length +
+          " 字符；扫码后在夸克里确认，再回到本页（切回时会立即补一次轮询）。"
+      );
+      this.startedAt = Date.now();
+      this.startCountdown();
       this.note("qr shown, payload_len=" + payload.length);
       this.restartTimer();
     } catch (e) {
@@ -2797,20 +2972,41 @@ class QuarkQrLoginModal extends Modal {
   async tick() {
     if (this.busy || this.finished || !this.token) return;
     if (Date.now() - this.startedAt >= QR_TTL_MS) {
-      this.finish("二维码已超时（累计 5 分钟未完成），请点「重新生成」");
+      this.logEvent("expired client-side");
+      this.finish(
+        "插件已主动停止轮询（客户端上限 " +
+          Math.round(QR_TTL_MS / 1000) +
+          " 秒；服务端实测 " +
+          QR_TTL_SECONDS +
+          " 秒）——这是插件侧超时，不是夸克侧过期，请点「重新生成」"
+      );
       return;
     }
     this.busy = true;
     try {
-      const url =
-        QUARK_TICKET_URL +
-        "&token=" +
-        encodeURIComponent(this.token) +
-        "&request_id=" +
-        encodeURIComponent(this.rid || "");
-      const res = await requestUrl({ url: url, method: "GET", throw: false });
-      const j = qrParseJson(res.text);
+      const headers = this.authHeaders();
+      this.logEvent("pollHeaders(cookieCount=" + this.tokenCookies.length + ")");
+      let res = await requestUrl({
+        url: QUARK_TICKET_URL_TOKEN + encodeURIComponent(this.token),
+        method: "GET",
+        headers: headers,
+        throw: false,
+      });
+      let j = qrParseJson(res.text);
+      if (!qrIsJsonResponse(res)) {
+        // 官方形态不可用时回退到旧形态（同样带 cookie/UA/Referer）
+        this.logEvent("pollFallback=true");
+        const u2 =
+          QUARK_TICKET_URL +
+          "&token=" +
+          encodeURIComponent(this.token) +
+          "&request_id=" +
+          encodeURIComponent(this.rid || "");
+        res = await requestUrl({ url: u2, method: "GET", headers: headers, throw: false });
+        j = qrParseJson(res.text);
+      }
       const st = j.status;
+      this.logPoll(st, j.message || "");
       if (st === 2000000) {
         const ticket = qrPickTicket(j);
         if (!ticket) {
@@ -2825,7 +3021,11 @@ class QuarkQrLoginModal extends Modal {
         return;
       }
       if (st === 50004002) {
-        this.finish("二维码已过期或 token 失效（50004002），请点「重新生成」");
+        this.finish(
+          "夸克侧 token 已过期（50004002，实测有效期 " +
+            QR_TTL_SECONDS +
+            " 秒），请点「重新生成」"
+        );
         return;
       }
       if (st === 50004003) {
@@ -2851,6 +3051,7 @@ class QuarkQrLoginModal extends Modal {
       const res = await requestUrl({
         url: QUARK_ACCOUNT_INFO + encodeURIComponent(ticket) + "&lw=scan",
         method: "GET",
+        headers: this.authHeaders(),
         throw: false,
       });
       const raws = qrSetCookieList(res.headers);
